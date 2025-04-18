@@ -6,6 +6,7 @@ function FindProxyForURL(url, host) {
         "download.jetbrains.com",
         "download-cdn.jetbrains.com"
         "google.com",
+        "dl.google.com",
         "www.google.com"
     ];
     

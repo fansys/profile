@@ -4,7 +4,7 @@ function FindProxyForURL(url, host) {
         "plugins.jetbrains.com",
         "downloads.marketplace.jetbrains.com",
         "download.jetbrains.com",
-        "download-cdn.jetbrains.com"
+        "download-cdn.jetbrains.com",
         "google.com",
         "dl.google.com",
         "www.google.com"

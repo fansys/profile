@@ -2,7 +2,9 @@ function FindProxyForURL(url, host) {
     // JetBrains 插件商店相关域名
     var proxyDomains = [
         "plugins.jetbrains.com",
+        "downloads.marketplace.jetbrains.com",
         "download.jetbrains.com",
+        "download-cdn.jetbrains.com"
         "google.com",
         "www.google.com"
     ];

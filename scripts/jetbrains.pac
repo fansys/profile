@@ -7,7 +7,8 @@ function FindProxyForURL(url, host) {
         "download-cdn.jetbrains.com",
         "google.com",
         "dl.google.com",
-        "www.google.com"
+        "www.google.com",
+        "gradle.org"
     ];
     
     for (var i = 0; i < proxyDomains.length; i++) {

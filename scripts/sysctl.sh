@@ -3,9 +3,11 @@
 set -o pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-SWAP_FILE="/swapfile"
+SCRIPT_VERSION="1.0.1"
+UPDATE_URL="https://gh.fansy.life/https://raw.githubusercontent.com/fansys/profile/master/scripts/sysctl.sh"
+SWAP_FILE="/swap"
 DEFAULT_SWAPPINESS=10
-NATCFG_URL="https://raw.githubusercontent.com/arloor/iptablesUtils/refs/heads/master/natcfg.sh"
+NATCFG_URL="https://gh.fansy.life/https://raw.githubusercontent.com/arloor/iptablesUtils/master/natcfg.sh"
 
 RED='\033[31m'
 GREEN='\033[32m'
@@ -46,6 +48,127 @@ get_pkg_manager() {
     else
         echo unknown
     fi
+}
+
+# =========================
+# 脚本自更新
+# =========================
+
+get_self_path() {
+    local src="${BASH_SOURCE[0]}"
+    if command_exists readlink; then
+        readlink -f "$src" 2>/dev/null && return 0
+    fi
+    printf '%s\n' "$src"
+}
+
+show_update_url() {
+    echo "脚本地址: $UPDATE_URL"
+}
+
+download_file() {
+    local url="$1" dest="$2"
+    if command_exists curl; then
+        curl --fail --silent --show-error --location \
+            --retry 5 --retry-delay 2 --connect-timeout 10 \
+            "$url" -o "$dest"
+    elif command_exists wget; then
+        wget -q --timeout=15 --tries=5 -O "$dest" "$url"
+    else
+        red "需要 curl 或 wget"
+        return 1
+    fi
+}
+
+self_update() {
+    require_root
+    local url="$UPDATE_URL"
+    local current tmp new backup
+
+    current="$(get_self_path)"
+    [ -f "$current" ] || {
+        red "无法确定当前脚本路径：$current"
+        return 1
+    }
+
+    tmp="$(mktemp /tmp/sysctl.sh.update.XXXXXX)" || return 1
+    new="${current}.new.$$"
+    backup="${current}.bak"
+
+    blue "当前版本：$SCRIPT_VERSION"
+    blue "更新地址：$url"
+    blue "正在下载新版本..."
+
+    if ! download_file "$url" "$tmp"; then
+        rm -f "$tmp" "$new"
+        red "脚本下载失败"
+        return 1
+    fi
+
+    [ -s "$tmp" ] || {
+        rm -f "$tmp"
+        red "下载到的脚本为空"
+        return 1
+    }
+
+    # 下载完成后必须先通过 Bash 语法检查，再允许覆盖当前脚本。
+    if ! bash -n "$tmp"; then
+        rm -f "$tmp"
+        red "新脚本语法校验失败，已取消更新"
+        return 1
+    fi
+
+    if cmp -s "$current" "$tmp"; then
+        rm -f "$tmp"
+        green "当前已经是最新版本"
+        return 0
+    fi
+
+    cp -p "$current" "$backup" || {
+        rm -f "$tmp"
+        red "无法创建备份：$backup"
+        return 1
+    }
+
+    install -m 0755 "$tmp" "$new" || {
+        rm -f "$tmp" "$new"
+        red "无法写入新脚本"
+        return 1
+    }
+
+    if command_exists chown; then
+        chown --reference="$current" "$new" 2>/dev/null || true
+    fi
+
+    mv -f "$new" "$current" || {
+        rm -f "$tmp" "$new"
+        red "替换脚本失败，原文件未被修改"
+        return 1
+    }
+    rm -f "$tmp"
+
+    green "脚本更新完成"
+    echo "脚本路径：$current"
+    echo "备份文件：$backup"
+    echo "如需回滚：$SCRIPT_NAME rollback-self"
+}
+
+self_rollback() {
+    require_root
+    local current backup tmp
+    current="$(get_self_path)"
+    backup="${current}.bak"
+    [ -f "$backup" ] || {
+        red "未找到备份文件：$backup"
+        return 1
+    }
+    bash -n "$backup" || {
+        red "备份脚本语法校验失败，拒绝回滚"
+        return 1
+    }
+    tmp="${current}.rollback.$$"
+    cp -p "$backup" "$tmp" && mv -f "$tmp" "$current"
+    green "已回滚到上一次更新前的版本"
 }
 
 install_packages() {
@@ -272,6 +395,7 @@ network_check() {
     echo; blue "网关测试"; [ -n "$gateway" ] && ping -c 3 -W 2 "$gateway" || true
     echo; blue "公网测试"; ping -c 3 -W 2 "$target" || true
     echo; blue "DNS 解析"; getent hosts "$domain" || true
+    echo; blue "网络配置后端"; detect_network_backend
 }
 
 dns_check() {
@@ -285,34 +409,125 @@ ports() {
     if command_exists ss; then ss -lntup; elif command_exists netstat; then netstat -lntup; else red "未找到 ss/netstat"; fi
 }
 
+get_default_iface() {
+    ip route show default 2>/dev/null | awk '{print $5; exit}'
+}
+
+detect_network_backend() {
+    # Netplan 是 Ubuntu 等系统的配置源，即使 renderer 是 NetworkManager，也优先按 Netplan 管理。
+    if command_exists netplan && find /etc/netplan -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) -print -quit 2>/dev/null | grep -q .; then
+        echo netplan
+        return 0
+    fi
+    if command_exists nmcli; then
+        echo networkmanager
+        return 0
+    fi
+    echo unknown
+}
+
 gateway_show() {
+    echo "当前默认路由："
     ip route show default
+    echo
+    echo "检测到的网络配置后端：$(detect_network_backend)"
 }
 
 gateway_set() {
     require_root
     local gw="${1:-}" iface="${2:-}"
     [ -n "$gw" ] || { red "用法: $SCRIPT_NAME gateway set <网关IP> [网卡]"; return 1; }
-    if [ -z "$iface" ]; then
-        iface="$(ip route show default | awk '{print $5; exit}')"
-        [ -n "$iface" ] || iface="$(ip -o link show | awk -F': ' '$2!="lo" {print $2; exit}')"
-    fi
+    [ -n "$iface" ] || iface="$(get_default_iface)"
+    [ -n "$iface" ] || iface="$(ip -o link show | awk -F': ' '$2!="lo" {print $2; exit}')"
+    [ -n "$iface" ] || { red "无法确定网卡"; return 1; }
     ip route replace default via "$gw" dev "$iface"
     green "默认网关已临时设置为 $gw dev $iface"
-    yellow "该设置重启后可能失效；Cloud-Init/PVE 管理的网络建议在 Cloud-Init 中持久化。"
 }
 
 gateway_persist_nm() {
     require_root
     local gw="${1:-}" iface="${2:-}" conn
-    [ -n "$gw" ] || { red "用法: $SCRIPT_NAME gateway persist <网关IP> [网卡]"; return 1; }
-    command_exists nmcli || { red "未检测到 NetworkManager/nmcli，无法安全自动写入持久配置"; return 1; }
-    [ -n "$iface" ] || iface="$(ip route show default | awk '{print $5; exit}')"
+    [ -n "$gw" ] || return 1
+    command_exists nmcli || { red "未检测到 nmcli"; return 1; }
+    [ -n "$iface" ] || iface="$(get_default_iface)"
+    [ -n "$iface" ] || { red "无法确定网卡"; return 1; }
     conn="$(nmcli -t -f NAME,DEVICE connection show --active | awk -F: -v dev="$iface" '$2==dev {print $1; exit}')"
-    [ -n "$conn" ] || { red "找不到网卡 $iface 的活动 NetworkManager 连接"; return 1; }
-    nmcli connection modify "$conn" ipv4.gateway "$gw"
+    [ -n "$conn" ] || conn="$(nmcli -t -f NAME,DEVICE connection show | awk -F: -v dev="$iface" '$2==dev {print $1; exit}')"
+    [ -n "$conn" ] || { red "找不到网卡 $iface 的 NetworkManager 连接"; return 1; }
+    nmcli connection modify "$conn" ipv4.gateway "$gw" ipv4.never-default no
     nmcli connection up "$conn"
-    green "已持久设置连接 [$conn] 的网关为 $gw"
+    green "NetworkManager 已持久设置：$conn -> gateway $gw"
+}
+
+gateway_persist_netplan() {
+    require_root
+    local gw="${1:-}" iface="${2:-}" existing origin_file backup
+    [ -n "$gw" ] || return 1
+    command_exists netplan || { red "未检测到 Netplan"; return 1; }
+    [ -n "$iface" ] || iface="$(get_default_iface)"
+    [ -n "$iface" ] || { red "无法确定网卡"; return 1; }
+
+    # 若该接口存在非默认静态路由，覆盖 routes 列表可能丢失配置，因此拒绝自动修改。
+    existing="$(netplan get "ethernets.${iface}.routes" 2>/dev/null || true)"
+    if [ -n "$existing" ] && printf '%s\n' "$existing" | awk '
+        /^[[:space:]]*to:/ {
+            v=$0; sub(/^[[:space:]]*to:[[:space:]]*/, "", v); gsub(/["'\'' ]/, "", v);
+            if (v != "default" && v != "0.0.0.0/0") bad=1
+        }
+        END {exit bad ? 0 : 1}
+    '; then
+        red "检测到 $iface 存在非默认静态路由，为避免覆盖自定义 routes，拒绝自动修改"
+        echo "请手工调整 Netplan，或先清理该接口的自定义 routes。"
+        return 1
+    fi
+
+    origin_file="/etc/netplan/99-sysctl-gateway.yaml"
+    [ -f "$origin_file" ] && cp -p "$origin_file" "${origin_file}.bak"
+
+    if ! netplan set --origin-hint 99-sysctl-gateway "ethernets.${iface}.routes=[{to: default, via: ${gw}}]"; then
+        red "netplan set 失败"
+        return 1
+    fi
+
+    if ! netplan generate; then
+        red "Netplan 配置校验失败"
+        [ -f "${origin_file}.bak" ] && mv -f "${origin_file}.bak" "$origin_file"
+        netplan generate >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    # 先更新当前路由，降低远程 SSH 因 apply 中断的风险，再应用 Netplan。
+    ip route replace default via "$gw" dev "$iface" || true
+    if ! netplan apply; then
+        red "netplan apply 失败，尝试恢复配置"
+        if [ -f "${origin_file}.bak" ]; then
+            mv -f "${origin_file}.bak" "$origin_file"
+        else
+            rm -f "$origin_file"
+        fi
+        netplan generate >/dev/null 2>&1 || true
+        netplan apply >/dev/null 2>&1 || true
+        return 1
+    fi
+    rm -f "${origin_file}.bak"
+    green "Netplan 已持久设置：$iface -> gateway $gw"
+}
+
+gateway_persist() {
+    require_root
+    local gw="${1:-}" iface="${2:-}" backend
+    [ -n "$gw" ] || { red "用法: $SCRIPT_NAME gateway persist <网关IP> [网卡]"; return 1; }
+    backend="$(detect_network_backend)"
+    blue "检测到网络配置后端：$backend"
+    case "$backend" in
+        netplan) gateway_persist_netplan "$gw" "$iface" ;;
+        networkmanager) gateway_persist_nm "$gw" "$iface" ;;
+        *)
+            red "无法识别 Netplan 或 NetworkManager，不能安全写入持久网关"
+            echo "可使用临时方式：$SCRIPT_NAME gateway set $gw ${iface:-}"
+            return 1
+            ;;
+    esac
 }
 
 # =========================
@@ -330,32 +545,87 @@ ensure_nfs_client() {
     esac
 }
 
+nfs_get_server() {
+    local remote="$1" host
+    case "$remote" in
+        \[*\]:*)
+            host="${remote#\[}"
+            host="${host%%\]*}"
+            ;;
+        *:*) host="${remote%%:*}" ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$host"
+}
+
+nfs_check() {
+    local remote="${1:-}" server resolved
+    [ -n "$remote" ] || { red "用法: $SCRIPT_NAME nfs check <server:/path|server>"; return 1; }
+
+    if printf '%s\n' "$remote" | grep -q ':'; then
+        server="$(nfs_get_server "$remote" 2>/dev/null || true)"
+    else
+        server="$remote"
+    fi
+    [ -n "$server" ] || { red "无法从 NFS 地址解析服务器：$remote"; return 1; }
+
+    resolved="$(getent ahostsv4 "$server" 2>/dev/null | awk '{print $1; exit}')"
+    [ -n "$resolved" ] || resolved="$(getent ahosts "$server" 2>/dev/null | awk '{print $1; exit}')"
+    [ -n "$resolved" ] || { red "无法解析 NFS 服务器：$server"; return 1; }
+    blue "NFS 服务器：$server ($resolved)"
+
+    # NFSv4 主要使用 TCP 2049。rpcinfo 可用时优先做 RPC 层检测。
+    if command_exists rpcinfo; then
+        if rpcinfo -t "$server" nfs 4 >/dev/null 2>&1 || rpcinfo -t "$server" nfs >/dev/null 2>&1; then
+            green "NFS RPC 连通性正常"
+            return 0
+        fi
+    fi
+
+    if command_exists nc; then
+        if nc -z -w 3 "$server" 2049 >/dev/null 2>&1; then
+            green "NFS TCP/2049 连通性正常"
+            return 0
+        fi
+    elif command_exists timeout; then
+        if timeout 4 bash -c "exec 3<>/dev/tcp/${server}/2049" >/dev/null 2>&1; then
+            green "NFS TCP/2049 连通性正常"
+            return 0
+        fi
+    fi
+
+    red "NFS 服务不可达：$server:2049"
+    echo "请检查服务端 NFS、路由、防火墙及 exports 配置。"
+    return 1
+}
+
 nfs_mount() {
     require_root
-    local remote="${1:-}" mountpoint="${2:-}" options="${3:-defaults,_netdev,nofail,x-systemd.automount}"
+    local remote="${1:-}" mountpoint="${2:-}" options="${3:-defaults,_netdev,nofail,x-systemd.automount}" direct_options
     [ -n "$remote" ] && [ -n "$mountpoint" ] || {
         red "用法: $SCRIPT_NAME nfs mount <server:/path> <本地目录> [options]"
         return 1
     }
     ensure_nfs_client || return 1
+    nfs_check "$remote" || return 1
     mkdir -p "$mountpoint"
 
-    # 清掉同一挂载点的旧 fstab 项，再写入新配置
+    # 先进行一次真实挂载测试，成功后才写 fstab，避免错误配置遗留到启动流程。
+    direct_options="$(printf '%s' "$options" | sed -E 's/(^|,)(nofail|_netdev|x-systemd\.automount)(,|$)/,/g; s/^,+//; s/,+$//; s/,,+/,/g')"
+    if mountpoint -q "$mountpoint" 2>/dev/null; then
+        umount "$mountpoint" || { red "无法卸载现有挂载：$mountpoint"; return 1; }
+    fi
+    if [ -n "$direct_options" ]; then
+        mount -t nfs -o "$direct_options" "$remote" "$mountpoint" || return 1
+    else
+        mount -t nfs "$remote" "$mountpoint" || return 1
+    fi
+
     awk -v mp="$mountpoint" '$2 != mp {print}' /etc/fstab > /etc/fstab.tmp.$$ && mv /etc/fstab.tmp.$$ /etc/fstab
     printf '%s %s nfs %s 0 0\n' "$remote" "$mountpoint" "$options" >> /etc/fstab
+    command_exists systemctl && systemctl daemon-reload
 
-    if command_exists systemctl; then systemctl daemon-reload; fi
-    if ! mount "$mountpoint" 2>/dev/null; then
-        # 去掉只适用于 fstab/systemd 的参数后直接尝试挂载
-        local direct_options
-        direct_options="$(printf '%s' "$options" | sed -E 's/(^|,)(nofail|_netdev|x-systemd\.automount)(,|$)/,/g; s/^,+//; s/,+$//; s/,,+/,/g')"
-        if [ -n "$direct_options" ]; then
-            mount -t nfs -o "$direct_options" "$remote" "$mountpoint"
-        else
-            mount -t nfs "$remote" "$mountpoint"
-        fi
-    fi
-    green "NFS 已挂载：$remote -> $mountpoint"
+    green "NFS 连通性检查及挂载成功：$remote -> $mountpoint"
     findmnt "$mountpoint" 2>/dev/null || mount | grep " $mountpoint " || true
 }
 
@@ -486,6 +756,12 @@ Linux 系统维护工具
 用法:
   $SCRIPT_NAME <command> [参数]
 
+脚本管理:
+  version                      查看脚本版本
+  update-self                  从内置地址下载并更新脚本
+  update-url                   查看内置更新地址
+  rollback-self                回滚到上一次更新前的脚本
+
 基础维护:
   info                         系统信息
   update                       系统更新
@@ -505,7 +781,7 @@ Linux 系统维护工具
 
 Swap:
   swap <size>                  设置 Swap，支持 0.5G/1.5G/512M/0
-  swap-remove                  删除 /swapfile
+  swap-remove                  删除 /swap
   swap-info                    查看 Swap
   swappiness <0-200>           设置 vm.swappiness
 
@@ -515,10 +791,11 @@ Swap:
   ports                        查看监听端口
   gateway show                 查看默认网关
   gateway set <gw> [iface]     临时修改默认网关
-  gateway persist <gw> [iface] 使用 NetworkManager 持久修改网关
+  gateway persist <gw> [iface] 自动识别 Netplan/NetworkManager 持久修改
 
 NFS:
   nfs list
+  nfs check <server:/path|server>
   nfs mount <server:/path> <mountpoint> [options]
   nfs unmount <mountpoint> [remove]
 
@@ -551,36 +828,42 @@ show_menu() {
     echo " 9. Docker 空间              21. 失败服务"
     echo "10. Docker 清理              22. 时间同步"
     echo "11. 磁盘占用                 23. 是否需要重启"
-    echo "12. 查找大文件"
+    echo "12. 查找大文件              24. 更新维护脚本"
+    echo "                            25. 查看脚本版本"
     echo " 0. 退出"
 }
 
 menu_gateway() {
     echo "1) 查看网关"
     echo "2) 临时设置网关"
-    echo "3) NetworkManager 持久设置"
+    echo "3) 自动持久设置（Netplan/NetworkManager）"
     read -r -p "请选择: " x
     case "$x" in
         1) gateway_show ;;
         2) read -r -p "网关IP: " gw; read -r -p "网卡(留空自动): " iface; gateway_set "$gw" "$iface" ;;
-        3) read -r -p "网关IP: " gw; read -r -p "网卡(留空自动): " iface; gateway_persist_nm "$gw" "$iface" ;;
+        3) read -r -p "网关IP: " gw; read -r -p "网卡(留空自动): " iface; gateway_persist "$gw" "$iface" ;;
     esac
 }
 
 menu_nfs() {
     echo "1) 查看 NFS"
-    echo "2) 挂载 NFS"
-    echo "3) 卸载 NFS"
+    echo "2) 检查 NFS 连通性"
+    echo "3) 挂载 NFS"
+    echo "4) 卸载 NFS"
     read -r -p "请选择: " x
     case "$x" in
         1) nfs_list ;;
         2)
+            read -r -p "远程地址(server:/path 或 server): " remote
+            nfs_check "$remote"
+            ;;
+        3)
             read -r -p "远程地址(server:/path): " remote
             read -r -p "本地目录: " mp
             read -r -p "挂载参数(留空使用默认): " opts
             nfs_mount "$remote" "$mp" "${opts:-defaults,_netdev,nofail,x-systemd.automount}"
             ;;
-        3)
+        4)
             read -r -p "本地目录: " mp
             read -r -p "同时删除 fstab? [y/N]: " yn
             if [ "$yn" = y ] || [ "$yn" = Y ]; then
@@ -645,6 +928,12 @@ interactive_menu() {
             21) failed_services ;;
             22) time_info ;;
             23) reboot_required ;;
+            24)
+                echo "当前更新地址: $UPDATE_URL"
+                read -r -p "直接更新? [Y/n]: " yn
+                if [ "$yn" != n ] && [ "$yn" != N ]; then self_update; fi
+                ;;
+            25) echo "sysctl.sh $SCRIPT_VERSION" ;;
             0) exit 0 ;;
             *) red "无效选项" ;;
         esac
@@ -654,6 +943,10 @@ interactive_menu() {
 
 case "${1:-}" in
     "") interactive_menu ;;
+    version) echo "sysctl.sh $SCRIPT_VERSION" ;;
+    update-self) self_update ;;
+    update-url) show_update_url ;;
+    rollback-self) self_rollback ;;
     info) system_info ;;
     update) system_update ;;
     clean) system_clean ;;
@@ -674,13 +967,14 @@ case "${1:-}" in
         case "${2:-show}" in
             show) gateway_show ;;
             set) gateway_set "${3:-}" "${4:-}" ;;
-            persist) gateway_persist_nm "${3:-}" "${4:-}" ;;
+            persist) gateway_persist "${3:-}" "${4:-}" ;;
             *) show_help; exit 1 ;;
         esac
         ;;
     nfs)
         case "${2:-list}" in
             list) nfs_list ;;
+            check) nfs_check "${3:-}" ;;
             mount) nfs_mount "${3:-}" "${4:-}" "${5:-defaults,_netdev,nofail,x-systemd.automount}" ;;
             unmount) nfs_unmount "${3:-}" "${4:-}" ;;
             *) show_help; exit 1 ;;

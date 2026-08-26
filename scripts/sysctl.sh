@@ -3,11 +3,12 @@
 set -o pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 UPDATE_URL="https://gh.fansy.life/https://raw.githubusercontent.com/fansys/profile/master/scripts/sysctl.sh"
 SWAP_FILE="/swap"
 DEFAULT_SWAPPINESS=10
 NATCFG_URL="https://gh.fansy.life/https://raw.githubusercontent.com/arloor/iptablesUtils/master/natcfg.sh"
+APT_UPDATED=0
 
 RED='\033[31m'
 GREEN='\033[32m'
@@ -66,17 +67,27 @@ show_update_url() {
     echo "脚本地址: $UPDATE_URL"
 }
 
+ensure_downloader() {
+    command_exists curl && return 0
+    command_exists wget && return 0
+
+    blue "未检测到 curl/wget，按需安装 curl..."
+    case "$(get_pkg_manager)" in
+        apt|dnf|yum|apk) install_packages curl ;;
+        *) red "无法自动安装下载工具"; return 1 ;;
+    esac
+}
+
 download_file() {
     local url="$1" dest="$2"
+    ensure_downloader || return 1
+
     if command_exists curl; then
         curl --fail --silent --show-error --location \
             --retry 5 --retry-delay 2 --connect-timeout 10 \
             "$url" -o "$dest"
-    elif command_exists wget; then
-        wget -q --timeout=15 --tries=5 -O "$dest" "$url"
     else
-        red "需要 curl 或 wget"
-        return 1
+        wget -q --timeout=15 --tries=5 -O "$dest" "$url"
     fi
 }
 
@@ -173,18 +184,33 @@ self_rollback() {
 
 install_packages() {
     require_root
+    [ "$#" -gt 0 ] || return 0
+
     local pm
     pm="$(get_pkg_manager)"
     case "$pm" in
         apt)
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y "$@"
+            # 只有真正缺少依赖并需要安装时才刷新 APT 索引；同一次脚本执行最多刷新一次。
+            if [ "$APT_UPDATED" -eq 0 ]; then
+                apt-get update
+                APT_UPDATED=1
+            fi
+            apt-get install -y --no-install-recommends "$@"
             ;;
-        dnf) dnf install -y "$@" ;;
-        yum) yum install -y "$@" ;;
-        apk) apk add --no-cache "$@" ;;
-        *) red "无法识别软件包管理器"; return 1 ;;
+        dnf)
+            dnf install -y --setopt=install_weak_deps=False "$@"
+            ;;
+        yum)
+            yum install -y "$@"
+            ;;
+        apk)
+            apk add --no-cache "$@"
+            ;;
+        *)
+            red "无法识别软件包管理器，请手动安装：$*"
+            return 1
+            ;;
     esac
 }
 
@@ -735,14 +761,44 @@ nat_delete_rule() {
 run_natcfg() {
     require_root
     local tmp="/tmp/natcfg.$$"
-    command_exists curl || install_packages curl || return 1
+
+    # natcfg 只有在实际使用时才准备依赖。
+    ensure_iptables || return 1
+    enable_ip_forward
+
     blue "下载并运行 arloor/iptablesUtils natcfg.sh ..."
-    curl -fsSL --retry 3 --connect-timeout 10 "$NATCFG_URL" -o "$tmp" || { rm -f "$tmp"; red "natcfg.sh 下载失败"; return 1; }
+    download_file "$NATCFG_URL" "$tmp" || {
+        rm -f "$tmp"
+        red "natcfg.sh 下载失败"
+        return 1
+    }
+
+    bash -n "$tmp" || {
+        rm -f "$tmp"
+        red "natcfg.sh 语法校验失败"
+        return 1
+    }
+
     chmod 700 "$tmp"
     bash "$tmp"
     local rc=$?
     rm -f "$tmp"
     return "$rc"
+}
+
+# =========================
+# 可选依赖状态
+# =========================
+
+dependency_status() {
+    echo "可选依赖状态（这里只检查，不会安装）："
+    line
+    printf "%-20s %s\n" "下载工具" "$(command_exists curl && echo 'curl' || { command_exists wget && echo 'wget' || echo '缺失（update-self 时按需安装 curl）'; })"
+    printf "%-20s %s\n" "NFS 客户端" "$(command_exists mount.nfs && echo '已安装' || echo '缺失（nfs mount 时按需安装）')"
+    printf "%-20s %s\n" "iptables" "$(command_exists iptables && echo '已安装' || echo '缺失（nat 功能时按需安装）')"
+    printf "%-20s %s\n" "Netplan" "$(command_exists netplan && echo '可用' || echo '未检测到')"
+    printf "%-20s %s\n" "NetworkManager" "$(command_exists nmcli && echo '可用' || echo '未检测到')"
+    printf "%-20s %s\n" "Docker" "$(command_exists docker && echo '可用' || echo '未安装（脚本不会自动安装）')"
 }
 
 # =========================
@@ -944,6 +1000,7 @@ interactive_menu() {
 case "${1:-}" in
     "") interactive_menu ;;
     version) echo "sysctl.sh $SCRIPT_VERSION" ;;
+    deps) dependency_status ;;
     update-self) self_update ;;
     update-url) show_update_url ;;
     rollback-self) self_rollback ;;

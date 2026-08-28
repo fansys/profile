@@ -1,0 +1,25 @@
+#!/sbin/openrc-run
+
+name="xboard-node"
+description="Xboard Node Service"
+
+command="/usr/local/bin/xboard-node"
+command_args="-c /etc/xboard-node/config.yml"
+
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+output_log="/etc/xboard-node/node.log"
+error_log="/etc/xboard-node/node.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath \
+        --file \
+        --mode 0644 \
+        /etc/xboard-node/node.log
+}

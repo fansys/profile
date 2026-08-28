@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# Quick install: curl -fsSL https://raw.githubusercontent.com/fansys/profile/master/scripts/xboard-node.sh -o ctl.sh && chmod +x ctl.sh && ./ctl.sh init
+
 set -e
 
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"

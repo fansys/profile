@@ -68,25 +68,18 @@ services:
     image: ${IMAGE}
     container_name: ${CONTAINER_NAME}
     network_mode: bridge
-
     command:
       - "-c"
       - "/etc/xboard-node/config.yml"
-
     ports:
       - "10000-10009:10000-10009"
       - "8443:8443/udp"
-
     volumes:
       - ./config.yml:/etc/xboard-node/config.yml
       - ./singbox.json:/etc/xboard-node/singbox.json
-      - ./node.log:/etc/xboard-node/node.log
-
     environment:
       TZ: Asia/Shanghai
-
     restart: unless-stopped
-
     logging:
       driver: local
       options:
@@ -129,22 +122,21 @@ panel:
 machine:
   machine_id: ${machine_id}
   token: ${token}
-
+  
 kernel:
   type: singbox
-
+  log_level: info
   custom_outbound:
     - type: direct
       tag: direct
       domain_resolver:
         server: cf
         strategy: prefer_ipv4
-
   custom_config: /etc/xboard-node/singbox.json
 
 log:
   level: info
-  output: /etc/xboard-node/node.log
+  output: stdout
 EOF
 
     chmod 600 "${CONFIG_FILE}"

@@ -1,318 +1,185 @@
-
 #!/bin/sh
+# Alpine Linux / OpenRC shadowsocks-rust installer
+# curl -fsSL https://raw.githubusercontent.com/fansys/profile/master/scripts/shadowsocks.sh | sh
+# 下载后执行（适合检查脚本后再运行）：
+# curl -fsSL https://raw.githubusercontent.com/fansys/profile/master/scripts/shadowsocks.sh -o shadowsocks.sh && sh shadowsocks.sh
 set -eu
 
-# Alpine Linux Shadowsocks-Rust 一键安装
-# OpenRC 服务名称: shadowsocks
-# 配置: /etc/shadowsocks/config.json
-# Quick install: curl -fsSL https://raw.githubusercontent.com/fansys/profile/master/scripts/shadowsocks.sh | sh
-
-NAME="shadowsocks"
-DIR="/etc/shadowsocks"
-CONF="$DIR/config.json"
-SERVICE="/etc/init.d/$NAME"
-BIN="/usr/local/bin/ssserver"
-REPO="https://github.com/shadowsocks/shadowsocks-rust"
-
+NAME=shadowsocks
+CONFIG_DIR=/etc/shadowsocks
+CONFIG_FILE=$CONFIG_DIR/config.json
+SERVICE_FILE=/etc/init.d/shadowsocks
+BIN=/usr/local/bin/ssserver
+REPO=https://github.com/shadowsocks/shadowsocks-rust
 DEFAULT_PORT=8388
-DEFAULT_METHOD="2022-blake3-aes-128-gcm"
+DEFAULT_METHOD=2022-blake3-aes-128-gcm
 
-info() {
-    printf '\033[32m[INFO]\033[0m %s\n' "$*"
+info() { printf '\033[32m[INFO]\033[0m %s\n' "$*"; }
+die() { printf '\033[31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
+
+[ "$(id -u)" -eq 0 ] || die '请以 root 身份运行'
+[ -f /etc/alpine-release ] || die '仅支持 Alpine Linux'
+command -v rc-service >/dev/null 2>&1 || die '未找到 OpenRC（rc-service）'
+
+# 从 /dev/tty 单独读取用户输入，不消耗 curl | sh 的脚本内容。
+# 无终端时直接使用默认值。FD 3 仅用于读取配置输入。
+INTERACTIVE=0
+if [ -r /dev/tty ] && ( : </dev/tty ) 2>/dev/null; then
+    exec 3</dev/tty
+    INTERACTIVE=1
+else
+    exec 3</dev/null
+fi
+
+ask() {
+    ANSWER=''
+    printf '%s' "$1" >&2
+    if [ "$INTERACTIVE" -eq 1 ]; then
+        IFS= read -r ANSWER <&3 || ANSWER=''
+    else
+        printf '\n' >&2
+    fi
 }
 
-error() {
-    printf '\033[31m[ERROR]\033[0m %s\n' "$*" >&2
-    exit 1
-}
+info '安装依赖...'
+apk add --no-cache curl ca-certificates xz openssl jq coreutils >/dev/null
 
-[ "$(id -u)" -eq 0 ] || error "请使用 root 执行"
-[ -f /etc/alpine-release ] || error "仅支持 Alpine Linux"
-command -v rc-service >/dev/null 2>&1 || \
-    error "未检测到 OpenRC"
-
-info "安装依赖..."
-apk add --no-cache curl ca-certificates xz \
-    openssl jq coreutils
-
-# CPU 架构
 case "$(uname -m)" in
-    x86_64)
-        ARCH="x86_64"
-        ;;
-    aarch64)
-        ARCH="aarch64"
-        ;;
-    *)
-        error "当前脚本支持 x86_64 / aarch64"
-        ;;
+    x86_64) TARGET=x86_64-unknown-linux-musl ;;
+    aarch64) TARGET=aarch64-unknown-linux-musl ;;
+    *) die "暂不支持的 CPU 架构：$(uname -m)" ;;
 esac
 
-TARGET="${ARCH}-unknown-linux-musl"
-
-echo ""
-echo "========== Shadowsocks 配置 =========="
-echo ""
-
-# 输入端口
+printf '\n========== Shadowsocks 配置 ==========\n\n'
 while :; do
-    printf "端口 [%s]: " "$DEFAULT_PORT"
-    read -r PORT || true
-    PORT="${PORT:-$DEFAULT_PORT}"
-
+    ask "端口 [$DEFAULT_PORT]: "
+    PORT=${ANSWER:-$DEFAULT_PORT}
     case "$PORT" in
-        *[!0-9]*|'')
-            echo "端口必须是数字"
-            continue
-            ;;
+        ''|*[!0-9]*) printf '端口必须为数字\n'; continue ;;
     esac
-
-    PORT="$(echo "$PORT" | sed 's/^0*//')"
-    PORT="${PORT:-0}"
-
-    if [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]; then
-        break
-    fi
-
-    echo "端口范围: 1-65535"
+    # 规避前导 0 和过长整数带来的 shell 数值问题
+    [ "${#PORT}" -le 5 ] || { printf '端口范围为 1-65535\n'; continue; }
+    PORT=$(printf '%s' "$PORT" | sed 's/^0*//')
+    PORT=${PORT:-0}
+    if [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]; then break; fi
+    printf '端口范围为 1-65535\n'
 done
 
-# 选择加密算法
-echo ""
-echo "加密算法:"
-echo "1) 2022-blake3-aes-128-gcm [默认]"
-echo "2) 2022-blake3-aes-256-gcm"
-echo "3) 2022-blake3-chacha20-poly1305"
-echo "4) aes-256-gcm"
-echo "5) aes-128-gcm"
-echo "6) chacha20-ietf-poly1305"
-echo ""
+printf '\n可选加密算法：\n'
+printf '  1) 2022-blake3-aes-128-gcm (默认)\n'
+printf '  2) 2022-blake3-aes-256-gcm\n'
+printf '  3) 2022-blake3-chacha20-poly1305\n'
+printf '  4) aes-256-gcm\n'
+printf '  5) aes-128-gcm\n'
+printf '  6) chacha20-ietf-poly1305\n\n'
+while :; do
+    ask '选择 [1]: '
+    case "${ANSWER:-1}" in
+        1) METHOD=2022-blake3-aes-128-gcm; KEY_BYTES=16; break ;;
+        2) METHOD=2022-blake3-aes-256-gcm; KEY_BYTES=32; break ;;
+        3) METHOD=2022-blake3-chacha20-poly1305; KEY_BYTES=32; break ;;
+        4) METHOD=aes-256-gcm; KEY_BYTES=0; break ;;
+        5) METHOD=aes-128-gcm; KEY_BYTES=0; break ;;
+        6) METHOD=chacha20-ietf-poly1305; KEY_BYTES=0; break ;;
+        *) printf '无效选项，请重试\n' ;;
+    esac
+done
 
-printf "请选择 [1]: "
-read -r CHOICE || true
-
-case "${CHOICE:-1}" in
-    1) METHOD="2022-blake3-aes-128-gcm" ;;
-    2) METHOD="2022-blake3-aes-256-gcm" ;;
-    3) METHOD="2022-blake3-chacha20-poly1305" ;;
-    4) METHOD="aes-256-gcm" ;;
-    5) METHOD="aes-128-gcm" ;;
-    6) METHOD="chacha20-ietf-poly1305" ;;
-    *) error "无效选项" ;;
-esac
-
-# 根据算法确定密钥长度
-case "$METHOD" in
-    2022-blake3-aes-128-gcm)
-        KEY_BYTES=16
-        ;;
-    2022-*)
-        KEY_BYTES=32
-        ;;
-    *)
-        KEY_BYTES=0
-        ;;
-esac
-
-# 验证 2022 密钥
-valid_key() {
-    KEY="$1"
-
-    DECODED="$(printf '%s' "$KEY" | \
-        openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' ')"
-
-    [ "$DECODED" = "$KEY_BYTES" ] || return 1
-
-    # 确认 Base64 格式及内容有效
-    NORMALIZED="$(printf '%s' "$KEY" | \
-        openssl base64 -d -A 2>/dev/null | \
-        openssl base64 -A 2>/dev/null)"
-
-    [ "$NORMALIZED" = "$KEY" ]
+valid_2022_key() {
+    # 解码后必须为正确字节数，重新编码需与输入完全一致。
+    decoded=$(printf '%s' "$1" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d '[:space:]')
+    [ "$decoded" = "$KEY_BYTES" ] || return 1
+    normalized=$(printf '%s' "$1" | openssl base64 -d -A 2>/dev/null | openssl base64 -A 2>/dev/null)
+    [ "$normalized" = "$1" ]
 }
 
-echo ""
+printf '\n'
 while :; do
     if [ "$KEY_BYTES" -gt 0 ]; then
-        echo "当前算法要求 Base64 编码的 ${KEY_BYTES} 字节密钥"
+        printf '此算法要求 %s 字节随机密钥的 Base64 编码\n' "$KEY_BYTES"
     fi
-
-    printf "密码/密钥 [回车自动生成]: "
-
-    if [ -t 0 ]; then
-        stty -echo
-    fi
-
-    PASSWORD=""
-    read -r PASSWORD || true
-
-    if [ -t 0 ]; then
-        stty echo
-    fi
-    echo ""
-
+    ask '密码/密钥 [回车自动生成]: '
+    PASSWORD=$ANSWER
     if [ -z "$PASSWORD" ]; then
         if [ "$KEY_BYTES" -gt 0 ]; then
-            PASSWORD="$(openssl rand -base64 "$KEY_BYTES" | tr -d '\n')"
+            PASSWORD=$(openssl rand -base64 "$KEY_BYTES" | tr -d '\n')
         else
-            PASSWORD="$(openssl rand -hex 24)"
+            PASSWORD=$(openssl rand -hex 24)
         fi
     fi
-
-    if [ "$KEY_BYTES" -gt 0 ]; then
-        if valid_key "$PASSWORD"; then
-            break
-        fi
-        echo "密钥格式错误，请重新输入"
-    else
-        break
-    fi
+    if [ "$KEY_BYTES" -eq 0 ] || valid_2022_key "$PASSWORD"; then break; fi
+    printf '2022 密钥不符合长度/Base64 格式，请重试\n'
 done
 
-echo ""
-echo "========== 当前配置 =========="
-echo "端口: $PORT"
-echo "加密: $METHOD"
-echo "密码: $PASSWORD"
-echo "协议: TCP + UDP"
-echo "服务: $NAME"
-echo "配置: $CONF"
-echo "开机自启: 是"
-echo "=============================="
-echo ""
+printf '\n端口：%s\n加密：%s\n密码/密钥：%s\nTCP/UDP：均启用\n开机自启：开启\n\n' "$PORT" "$METHOD" "$PASSWORD"
 
-# 获取最新版本
-info "获取官方最新版本..."
-
-VERSION="$(curl -fsSL --retry 3 \
-    https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest \
-    | jq -r '.tag_name // empty')"
-
-[ -n "$VERSION" ] || error "获取版本失败"
-
-ASSET="shadowsocks-${VERSION}.${TARGET}.tar.xz"
-URL="$REPO/releases/download/$VERSION/$ASSET"
-
-WORKDIR="$(mktemp -d)"
+info '查询 GitHub 官方最新版本及构建资源...'
+WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
+trap 'exit 1' HUP INT TERM
+curl -fsSL --retry 3 --connect-timeout 15 \
+    https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest \
+    -o "$WORKDIR/release.json" || die '查询 GitHub Releases 失败'
+VERSION=$(jq -r '.tag_name // empty' "$WORKDIR/release.json")
+[ -n "$VERSION" ] || die '无法解析发布版本'
+ASSET=$(jq -r --arg target "$TARGET" '.assets[].name | select(endswith("." + $target + ".tar.xz"))' "$WORKDIR/release.json" | head -n 1)
+[ -n "$ASSET" ] || die "官方发布版本 $VERSION 未提供 $TARGET 的安装包"
+DOWNLOAD_URL=$(jq -r --arg asset "$ASSET" '.assets[] | select(.name == $asset) | .browser_download_url' "$WORKDIR/release.json")
+CHECK_URL=$(jq -r --arg asset "$ASSET.sha256" '.assets[] | select(.name == $asset) | .browser_download_url' "$WORKDIR/release.json")
+[ -n "$CHECK_URL" ] || die '未找到对应 SHA256 校验文件'
 
-info "下载 Shadowsocks-Rust $VERSION ..."
+info "下载 $VERSION ($TARGET)..."
+curl -fL --retry 3 --connect-timeout 15 "$DOWNLOAD_URL" -o "$WORKDIR/$ASSET" || die '下载失败'
+curl -fL --retry 3 --connect-timeout 15 "$CHECK_URL" -o "$WORKDIR/checksum" || die '下载校验文件失败'
+EXPECTED=$(awk 'NR==1 {print $1}' "$WORKDIR/checksum")
+ACTUAL=$(sha256sum "$WORKDIR/$ASSET" | awk '{print $1}')
+[ -n "$EXPECTED" ] && [ "$EXPECTED" = "$ACTUAL" ] || die 'SHA256 校验失败'
 
-curl -fL --retry 3 "$URL" \
-    -o "$WORKDIR/$ASSET" \
-    || error "下载失败"
+mkdir -p "$WORKDIR/unpack"
+tar -xJf "$WORKDIR/$ASSET" -C "$WORKDIR/unpack" || die '解压安装包失败'
+SERVER=$(find "$WORKDIR/unpack" -type f -name ssserver -print -quit)
+[ -n "$SERVER" ] || die '安装包中未找到 ssserver'
 
-# SHA256 校验
-info "校验安装包..."
+# 先创建新配置并保留旧文件备份。
+mkdir -p "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR"
+jq -n --arg server '0.0.0.0' --argjson port "$PORT" \
+    --arg method "$METHOD" --arg password "$PASSWORD" \
+    '{server:$server, server_port:$port, method:$method, password:$password, mode:"tcp_and_udp"}' \
+    > "$WORKDIR/config.json" || die '无法生成配置'
 
-curl -fL --retry 3 "$URL.sha256" \
-    -o "$WORKDIR/checksum" \
-    || error "下载校验文件失败"
-
-EXPECTED="$(awk 'NR==1 {print $1}' "$WORKDIR/checksum")"
-ACTUAL="$(sha256sum "$WORKDIR/$ASSET" | awk '{print $1}')"
-
-[ "$EXPECTED" = "$ACTUAL" ] || error "SHA256 校验失败"
-
-# 解压
-mkdir -p "$WORKDIR/extract"
-
-tar -xJf "$WORKDIR/$ASSET" \
-    -C "$WORKDIR/extract"
-
-SERVER="$(find "$WORKDIR/extract" \
-    -type f -name ssserver | head -n 1)"
-
-[ -n "$SERVER" ] || error "未找到 ssserver"
-
-# 安装
-info "安装服务端程序..."
-
-# 停止已存在的同名服务
-if [ -f "$SERVICE" ]; then
-    rc-service "$NAME" stop || true
-fi
-
-install -m 755 "$SERVER" "$BIN"
-
-# 创建配置
-mkdir -p "$DIR"
-chmod 700 "$DIR"
-
-if [ -f "$CONF" ]; then
-    cp -p "$CONF" "$CONF.bak"
-    info "旧配置已备份到 $CONF.bak"
-fi
-
-jq -n \
-    --arg server "0.0.0.0" \
-    --argjson port "$PORT" \
-    --arg password "$PASSWORD" \
-    --arg method "$METHOD" \
-    '{
-        server: $server,
-        server_port: $port,
-        password: $password,
-        method: $method,
-        mode: "tcp_and_udp"
-    }' > "$CONF"
-
-chmod 600 "$CONF"
-
-# 安装 OpenRC 服务
-info "配置 OpenRC..."
-
-cat > "$SERVICE" <<'EOF'
+# 配置服务，supervise-daemon 可在进程异常终止时重启服务。
+cat > "$WORKDIR/openrc" <<'EOF'
 #!/sbin/openrc-run
-
 name="shadowsocks"
 description="Shadowsocks-Rust Server"
-
 supervisor="supervise-daemon"
-
 command="/usr/local/bin/ssserver"
 command_args="-c /etc/shadowsocks/config.json"
-
 respawn_delay=5
 respawn_max=0
-
 depend() {
     need net
 }
 EOF
 
-chmod 755 "$SERVICE"
+if [ -f "$SERVICE_FILE" ]; then
+    info '停止现有 Shadowsocks 服务...'
+    rc-service "$NAME" stop || true
+fi
+[ ! -f "$CONFIG_FILE" ] || cp -p "$CONFIG_FILE" "$CONFIG_FILE.bak"
+install -m 755 "$SERVER" "$BIN"
+install -m 600 "$WORKDIR/config.json" "$CONFIG_FILE"
+install -m 755 "$WORKDIR/openrc" "$SERVICE_FILE"
 
-# 设置开机自启
+info '设置开机自启并启动服务...'
 rc-update add "$NAME" default
-
-# 启动
-info "启动 Shadowsocks..."
-rc-service "$NAME" start || error "服务启动失败"
-
+rc-service "$NAME" start || die '服务启动失败；检查日志排查原因'
 sleep 2
+rc-service "$NAME" status || die '服务状态异常'
 
-rc-service "$NAME" status || error "服务运行异常"
-
-echo ""
-echo "========================================"
-echo " Shadowsocks-Rust 安装完成！"
-echo "========================================"
-echo "版本: $VERSION"
-echo "服务名称: $NAME"
-echo "服务器端口: $PORT"
-echo "加密算法: $METHOD"
-echo "连接密钥: $PASSWORD"
-echo "网络协议: TCP + UDP"
-echo "配置文件: $CONF"
-echo "开机自启: 已开启"
-echo "========================================"
-echo ""
-echo "启动: rc-service shadowsocks start"
-echo "停止: rc-service shadowsocks stop"
-echo "重启: rc-service shadowsocks restart"
-echo "状态: rc-service shadowsocks status"
-echo ""
-echo "请确保防火墙和云服务器安全组已放行"
-echo "TCP/UDP 端口: $PORT"
-echo ""
+printf '\n========== 安装完成 ==========\n'
+printf '版本：%s\n端口：%s\n算法：%s\n密钥：%s\n' "$VERSION" "$PORT" "$METHOD" "$PASSWORD"
+printf '配置：%s\n服务：%s（已设置开机自启）\n' "$CONFIG_FILE" "$NAME"
+printf '管理：rc-service shadowsocks {start|stop|restart|status}\n'
+printf '请放行服务器及云安全组 TCP/UDP %s 端口。\n' "$PORT"

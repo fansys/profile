@@ -5,6 +5,7 @@ set -eu
 # Alpine Linux Shadowsocks-Rust 一键安装
 # OpenRC 服务名称: shadowsocks
 # 配置: /etc/shadowsocks/config.json
+# Quick install: curl -fsSL https://raw.githubusercontent.com/fansys/profile/master/scripts/shadowsocks.sh | sh
 
 NAME="shadowsocks"
 DIR="/etc/shadowsocks"

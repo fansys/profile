@@ -25,6 +25,7 @@ mem_limit=${GOMEMLIMIT:-96MiB}
 gc_percent=${GOGC:-50}
 cf_dns=${CF_DNS:-no}
 action=install
+assume_yes=no
 paste_command=
 
 info() { echo "[INFO] $*"; }
@@ -53,6 +54,7 @@ Options:
   --gomemlimit SIZE             Default 96MiB
   --gogc NUMBER                 Default 50
   --cf-dns yes|no               Optional Cloudflare DNS and direct outbound
+  --yes                         Overwrite existing configuration without prompting
 
 Examples:
   sh install-xboard-node.sh
@@ -73,6 +75,7 @@ parse_args() {
     esac
     while [ "$#" -gt 0 ]; do
         case "$1" in
+            --yes|-y) assume_yes=yes; shift ;;
             --backend|--mode|--panel|--token|--node-id|--machine-id|--kernel|--version|--binary|--gomemlimit|--gogc|--cf-dns|--from-command)
                 [ "$#" -ge 2 ] || fail "Missing value for $1"
                 case "$1" in
@@ -228,9 +231,30 @@ yaml_quote() {
 
 confirm_replace() {
     [ -e "$CONFIG" ] || return 0
-    [ -r /dev/tty ] || fail 'Config exists: run interactively to confirm replacement'
-    ask 'Overwrite existing configuration? [y/N]' ''
-    case "$answer" in y|Y|yes) : ;; *) fail 'Cancelled' ;; esac
+
+    if [ "$assume_yes" = yes ]; then
+        info 'Existing configuration will be replaced (--yes).'
+        return 0
+    fi
+
+    [ -r /dev/tty ] && [ -w /dev/tty ] ||
+        fail 'No interactive terminal. Re-run in a terminal or use --yes.'
+
+    echo > /dev/tty
+    echo "Existing configuration: $CONFIG" > /dev/tty
+    echo 'It will be replaced. Enter y to continue, n to cancel.' > /dev/tty
+
+    while :; do
+        echo -n 'Overwrite configuration? [y/N]: ' > /dev/tty
+        if ! IFS= read -r confirmation < /dev/tty; then
+            fail 'Cannot read terminal input. Run with sh install.sh or pass --yes.'
+        fi
+        case "$confirmation" in
+            y|Y|yes|YES) return 0 ;;
+            n|N|no|NO|'') info 'Cancelled by user; configuration unchanged.'; exit 0 ;;
+            *) warn 'Please type y or n.' ;;
+        esac
+    done
 }
 
 write_config() {

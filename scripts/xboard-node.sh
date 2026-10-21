@@ -1,7 +1,6 @@
 #!/bin/sh
-# Xboard-Node: Alpine/OpenRC and Debian/systemd, native or Docker Compose.
-# Quick install: curl -fsSL https://raw.githubusercontent.com/fansys/profile/master/scripts/xboard-node.sh -o ctl.sh && chmod +x ctl.sh && ./ctl.sh init
-
+# Xboard-Node: Alpine/OpenRC, Debian/Ubuntu/CentOS/systemd; native or Docker Compose.
+# Quick install: curl -fsSL https://raw.githubusercontent.com/fansys/profile/master/scripts/xboard-node.sh | sh
 set -eu
 umask 077
 
@@ -35,6 +34,7 @@ fail() { echo "[ERROR] $*" >&2; exit 1; }
 help() {
     cat <<'EOF'
 Xboard-Node Manager
+Supported: Alpine (OpenRC), Debian / Ubuntu / CentOS (systemd)
 
 Usage:
   sh install-xboard-node.sh [install|config|start|stop|restart|status|logs|shell|clear|upgrade|uninstall] [options]
@@ -94,10 +94,30 @@ detect_os() {
     [ -r /etc/os-release ] || fail 'Cannot detect OS'
     . /etc/os-release
     case "$ID" in
-        alpine) service=openrc ;;
-        debian) service=systemd; [ -d /run/systemd/system ] || fail 'systemd is required on Debian' ;;
-        *) fail 'Supported systems: Alpine and Debian' ;;
+        alpine)
+            service=openrc
+            package_manager=apk
+            ;;
+        debian|ubuntu)
+            service=systemd
+            package_manager=apt
+            ;;
+        centos)
+            service=systemd
+            if command -v dnf >/dev/null 2>&1; then
+                package_manager=dnf
+            elif command -v yum >/dev/null 2>&1; then
+                package_manager=yum
+            else
+                fail 'Neither dnf nor yum is available on CentOS'
+            fi
+            ;;
+        *) fail 'Supported systems: Alpine, Debian, Ubuntu and CentOS' ;;
     esac
+    if [ "$service" = systemd ]; then
+        [ -d /run/systemd/system ] || fail "systemd is required on $ID"
+        command -v systemctl >/dev/null 2>&1 || fail 'systemctl is missing'
+    fi
     case "$(uname -m)" in
         x86_64) arch=amd64 ;; aarch64) arch=arm64 ;;
         *) fail 'Only amd64 and arm64 binaries are supported' ;;
@@ -288,12 +308,21 @@ EOF
 ensure_downloader() {
     command -v curl >/dev/null 2>&1 && return
     command -v wget >/dev/null 2>&1 && return
-    if [ "$service" = openrc ]; then
-        apk add --no-cache curl ca-certificates
-    else
-        apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl ca-certificates
-    fi
+    case "$package_manager" in
+        apk)
+            apk add --no-cache curl ca-certificates
+            ;;
+        apt)
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl ca-certificates
+            ;;
+        dnf)
+            dnf install -y curl ca-certificates
+            ;;
+        yum)
+            yum install -y curl ca-certificates
+            ;;
+    esac
 }
 
 install_binary() {

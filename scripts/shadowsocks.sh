@@ -6,7 +6,7 @@
 # curl -fsSL https://raw.githubusercontent.com/fansys/profile/master/scripts/shadowsocks.sh -o shadowsocks.sh && sh shadowsocks.sh
 set -eu
 
-NAME=shadowsocks
+SERVICE_NAME=shadowsocks
 CONFIG_DIR=/etc/shadowsocks
 CONFIG_FILE=$CONFIG_DIR/config.json
 BIN=/usr/local/bin/ssserver
@@ -26,12 +26,12 @@ case "$OS_ID" in
     alpine)
         FAMILY=alpine
         PKG=apk
-        SERVICE_FILE=/etc/init.d/$NAME
+        SERVICE_FILE=/etc/init.d/${SERVICE_NAME}
         ;;
     ubuntu|debian)
         FAMILY=debian
         PKG=apt-get
-        SERVICE_FILE=/etc/systemd/system/$NAME.service
+        SERVICE_FILE=/etc/systemd/system/$SERVICE_NAME.service
         ;;
     centos|rhel|rocky|almalinux|ol|fedora)
         FAMILY=rhel
@@ -42,17 +42,17 @@ case "$OS_ID" in
         else
             die '未找到 dnf 或 yum'
         fi
-        SERVICE_FILE=/etc/systemd/system/$NAME.service
+        SERVICE_FILE=/etc/systemd/system/$SERVICE_NAME.service
         ;;
     *)
         case " $OS_LIKE " in
-            *' debian '*) FAMILY=debian; PKG=apt-get; SERVICE_FILE=/etc/systemd/system/$NAME.service ;;
+            *' debian '*) FAMILY=debian; PKG=apt-get; SERVICE_FILE=/etc/systemd/system/$SERVICE_NAME.service ;;
             *' rhel '*|*' fedora '*)
                 FAMILY=rhel
                 if command -v dnf >/dev/null 2>&1; then PKG=dnf
                 elif command -v yum >/dev/null 2>&1; then PKG=yum
                 else die '未找到 dnf 或 yum'; fi
-                SERVICE_FILE=/etc/systemd/system/$NAME.service
+                SERVICE_FILE=/etc/systemd/system/$SERVICE_NAME.service
                 ;;
             *) die "不支持的发行版：$OS_ID" ;;
         esac
@@ -240,12 +240,12 @@ chmod 700 "$CONFIG_DIR"
 if [ "$FAMILY" = alpine ]; then
     if [ -f "$SERVICE_FILE" ]; then
         info '停止已有 OpenRC 服务...'
-        rc-service "$NAME" stop || true
+        rc-service "${SERVICE_NAME}" stop || true
     fi
 else
     if [ -f "$SERVICE_FILE" ]; then
         info '停止已有 systemd 服务...'
-        systemctl stop "$NAME" || true
+        systemctl stop "${SERVICE_NAME}" || true
     fi
 fi
 [ ! -f "$CONFIG_FILE" ] || cp -p "$CONFIG_FILE" "$CONFIG_FILE.bak"
@@ -253,26 +253,27 @@ fi
 [ ! -f "$SERVICE_FILE" ] || cp -p "$SERVICE_FILE" "$SERVICE_FILE.bak"
 install -m 755 "$SERVER" "$BIN"
 install -m 600 "$WORKDIR/config.json" "$CONFIG_FILE"
-install -m 755 "$WORKDIR/service" "$SERVICE_FILE"
+install -m 644 "$WORKDIR/service" "$SERVICE_FILE"
+[ "$FAMILY" != alpine ] || chmod 755 "$SERVICE_FILE"
 
 info '启用并启动服务...'
 if [ "$FAMILY" = alpine ]; then
-    rc-update add "$NAME" default
-    rc-service "$NAME" start || die '服务启动失败，请检查 OpenRC 日志'
+    rc-update add "${SERVICE_NAME}" default
+    rc-service "${SERVICE_NAME}" start || die '服务启动失败，请检查 OpenRC 日志'
     sleep 2
-    rc-service "$NAME" status || die '服务状态异常'
+    rc-service "${SERVICE_NAME}" status || die '服务状态异常'
     MANAGE='rc-service shadowsocks {start|stop|restart|status}'
 else
     systemctl daemon-reload
-    systemctl enable "$NAME" >/dev/null
-    systemctl restart "$NAME" || die '服务启动失败，请运行 journalctl -u shadowsocks -n 50 --no-pager'
+    systemctl enable "${SERVICE_NAME}" >/dev/null
+    systemctl restart "${SERVICE_NAME}" || die '服务启动失败，请运行 journalctl -u shadowsocks -n 50 --no-pager'
     sleep 2
-    systemctl is-active --quiet "$NAME" || die '服务状态异常，请运行 journalctl -u shadowsocks -n 50 --no-pager'
+    systemctl is-active --quiet "${SERVICE_NAME}" || die '服务状态异常，请运行 journalctl -u shadowsocks -n 50 --no-pager'
     MANAGE='systemctl {start|stop|restart|status} shadowsocks'
 fi
 
 printf '\n========== 安装完成 ==========\n'
 printf '系统：%s\n版本：%s\n端口：%s\n算法：%s\n密钥：%s\n' "${PRETTY_NAME:-$OS_ID}" "$VERSION" "$PORT" "$METHOD" "$PASSWORD"
-printf '配置：%s\n服务：%s（已设置开机自启）\n' "$CONFIG_FILE" "$NAME"
+printf '配置：%s\n服务：%s（已设置开机自启）\n' "$CONFIG_FILE" "${SERVICE_NAME}"
 printf '管理：%s\n' "$MANAGE"
 printf '请放行服务器防火墙及云安全组中的 TCP/UDP %s 端口。\n' "$PORT"
